@@ -19,6 +19,12 @@ scripts_demo*
 build/
 develop-eggs/
 dist/
+# The sequence-parallel (xfuser) package under src/ is REQUIRED at import time
+# and must ship with the repo, so re-include it despite the dist/ rule above.
+!src/dist/
+src/dist/*
+!src/dist/__init__.py
+!src/dist/wan_xfuser.py
 downloads/
 eggs/
 .eggs/
