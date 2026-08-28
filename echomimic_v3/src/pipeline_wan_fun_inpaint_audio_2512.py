@@ -353,33 +353,55 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
     def prepare_mask_latents(
         self, mask, masked_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance, noise_aug_strength
     ):
-        if self.vae.device!=device:
-            self.vae.to(device)
-        if mask is not None:
-            mask = mask.to(device=device, dtype=self.vae.dtype)
-            bs = 1
-            new_mask = []
-            for i in range(0, mask.shape[0], bs):
-                mask_bs = mask[i : i + bs]
-                mask_bs = self.vae.encode(mask_bs)[0]
-                mask_bs = mask_bs.mode()
-                new_mask.append(mask_bs)
-            mask = torch.cat(new_mask, dim = 0)
+        # VAE mask encoding is one of the biggest transient VRAM spikes and it
+        # happens BEFORE the denoising loop whose `block_offload` manages the
+        # transformer. Without care the whole ~1.5B transformer sits on GPU and
+        # stacks on top of the 3D VAE conv peak, which OOMs low-VRAM GPUs (T4,
+        # 16GB). To give the VAE headroom we temporarily move the transformer
+        # to CPU for the encode and move it back afterwards. This is safe and
+        # reversible, and only fights the peak, not correctness.
+        transformer_restore_device = None
+        transformer = getattr(self, "transformer", None)
+        if transformer is not None and transformer.device.type != "cpu":
+            transformer_restore_device = transformer.device
+            try:
+                transformer.to("cpu")
+            except Exception:
+                transformer_restore_device = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        if masked_image is not None:
-            masked_image = masked_image.to(device=device, dtype=self.vae.dtype)
-            bs = 1
-            new_mask_pixel_values = []
-            for i in range(0, masked_image.shape[0], bs):
-                mask_pixel_values_bs = masked_image[i : i + bs]
-                mask_pixel_values_bs = self.vae.encode(mask_pixel_values_bs)[0]
-                mask_pixel_values_bs = mask_pixel_values_bs.mode()
-                new_mask_pixel_values.append(mask_pixel_values_bs)
-            masked_image_latents = torch.cat(new_mask_pixel_values, dim = 0)
-        else:
-            masked_image_latents = None
-        self.vae.to("cpu")
-        return mask, masked_image_latents
+        try:
+            if self.vae.device!=device:
+                self.vae.to(device)
+            if mask is not None:
+                mask = mask.to(device=device, dtype=self.vae.dtype)
+                bs = 1
+                new_mask = []
+                for i in range(0, mask.shape[0], bs):
+                    mask_bs = mask[i : i + bs]
+                    mask_bs = self.vae.encode(mask_bs)[0]
+                    mask_bs = mask_bs.mode()
+                    new_mask.append(mask_bs)
+                mask = torch.cat(new_mask, dim = 0)
+
+            if masked_image is not None:
+                masked_image = masked_image.to(device=device, dtype=self.vae.dtype)
+                bs = 1
+                new_mask_pixel_values = []
+                for i in range(0, masked_image.shape[0], bs):
+                    mask_pixel_values_bs = masked_image[i : i + bs]
+                    mask_pixel_values_bs = self.vae.encode(mask_pixel_values_bs)[0]
+                    mask_pixel_values_bs = mask_pixel_values_bs.mode()
+                    new_mask_pixel_values.append(mask_pixel_values_bs)
+                masked_latents = torch.cat(new_mask_pixel_values, dim = 0)
+            else:
+                masked_latents = None
+            self.vae.to("cpu")
+            return mask, masked_latents
+        finally:
+            if transformer is not None and transformer_restore_device is not None:
+                transformer.to(transformer_restore_device)
 
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         if self.vae.device!=latents.device:
