@@ -1,0 +1,48 @@
+# Sensitive / internal files
+.env
+*.pem
+*.key
+sync.sh
+deploy.sh
+cptorh*.sh
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights (large files)
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+models/
+weights/
+
+# Temporary / generated files
+*.log
+*.tmp
+*.temp
+sample_results/
+
+# Logs
+*.log
+.codegraph/
+.omo/
+

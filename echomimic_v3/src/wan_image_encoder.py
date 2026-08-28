@@ -196,7 +196,7 @@ class AttentionPool(nn.Module):
         k, v = self.to_kv(x).view(b, s, 2, n, d).unbind(2)
 
         # compute attention
-        x = flash_attention(q, k, v, version=2)
+        x = attention(q, k, v, dropout_p=0.0)
         x = x.reshape(b, 1, c)
 
         # output

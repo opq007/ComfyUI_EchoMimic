@@ -42,6 +42,29 @@ try:
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
+# SageAttention is probed by distinct entry points because different community
+# builds expose different kernels:
+#   * `sageattn_varlen`             — official build, Triton varlen kernel.
+#   * `sageattn_qk_int8_pv_fp16_cuda` — community magic build (e.g. for older
+#     GPUs such as T4 / sm_75) that only ships the batched INT8+FP16 CUDA op.
+# Each is optional and degrades gracefully to flash-attn / SDPA if absent.
+try:
+    from sageattention import sageattn_varlen
+    SAGE_VARLEN_AVAILABLE = True
+except Exception:
+    sageattn_varlen = None
+    SAGE_VARLEN_AVAILABLE = False
+
+try:
+    from sageattention import sageattn_qk_int8_pv_fp16_cuda
+    SAGE_INT8_CUDA_AVAILABLE = True
+except Exception:
+    sageattn_qk_int8_pv_fp16_cuda = None
+    SAGE_INT8_CUDA_AVAILABLE = False
+
+# Any sage kernel is enough to route through the sage dispatch path.
+SAGE_ATTN_AVAILABLE = SAGE_VARLEN_AVAILABLE or SAGE_INT8_CUDA_AVAILABLE
+
 
 class BlockGPUManager:
     def __init__(self, device="cuda",block_group_size=1 ):
@@ -57,9 +80,12 @@ class BlockGPUManager:
         """获取GPU内存使用情况"""
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-            allocated = torch.cuda.memory_allocated() / 1024 / 1024  # MB
-            reserved = torch.cuda.memory_reserved() / 1024 / 1024  # MB
-            total = torch.cuda.get_device_properties(0).total_memory / 1024 / 1024  # MB
+            # Query the device this manager actually runs on, not hard-coded
+            # device 0, so this stays correct on multi-GPU hosts.
+            device_idx = torch.cuda.current_device()
+            allocated = torch.cuda.memory_allocated(device_idx) / 1024 / 1024  # MB
+            reserved = torch.cuda.memory_reserved(device_idx) / 1024 / 1024  # MB
+            total = torch.cuda.get_device_properties(device_idx).total_memory / 1024 / 1024  # MB
             free = total - allocated
             
             return {
@@ -157,6 +183,71 @@ def get_ai2v_audio(
     return first_frame_audio_emb_s, latter_frame_audio_emb_s
 
 
+def _sage_attn_pack(q, k, v, q_lens, k_lens, b, lq, lk,
+                    causal, softmax_scale, dtype, out_dtype):
+    """Dispatch SageAttention on the package-flat Q/K/V.
+
+    ``q/k/v`` arrive already packed as ``[total_seq, num_heads, head_dim]``
+    (exactly the layout the varlen kernels want).  The community-magic build
+    exposed on T4 only ships the *batched* INT8+FP16 CUDA operator
+    (``sageattn_qk_int8_pv_fp16_cuda``, layout ``NHD`` = [B, S, H, D]).  With
+    ``b == 1`` the packed tensor is simply one sequence, so we reshape it back
+    to ``[1, seq, H, D]`` and call the batched kernel.  Multi-item batches use
+    ``sageattn_varlen`` when available.
+
+    Returns ``None`` when no sage kernel applies, so the caller falls through
+    to flash-attn / SDPA.
+    """
+    # dtypes must be fp16/bf16 (the INT8 kernel asserts this).
+    if dtype not in (torch.float16, torch.bfloat16):
+        return None
+    # Single-sequence batched INT8 op: only safe when there is no var-length
+    # padding truncation (q/k packed length == the true max for the batch).
+    # This holds for the normal ComfyUI single-video T4 path. Multi-item
+    # batches fall through to sageattn_varlen / flash / SDPA.
+    int8_safe = (SAGE_INT8_CUDA_AVAILABLE and b == 1
+                 and (q_lens is None or int(q_lens[0]) == lq)
+                 and (k_lens is None or int(k_lens[0]) == lk))
+    if int8_safe:
+        int8_out = _sage_attn_int8_batch(
+            q, k, v, causal, softmax_scale, dtype, out_dtype)
+        if int8_out is not None:
+            return int8_out
+    if SAGE_VARLEN_AVAILABLE and q_lens is not None and k_lens is not None:
+        cu_seqlens_q = torch.cat(
+            [q_lens.new_zeros([1]), q_lens]).cumsum(0, dtype=torch.int32).to(
+                q.device, non_blocking=True)
+        cu_seqlens_k = torch.cat(
+            [k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32).to(
+                k.device, non_blocking=True)
+        x = sageattn_varlen(
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q=lq, max_seqlen_k=lk,
+            is_causal=causal, sm_scale=softmax_scale)
+        return x.unflatten(0, (b, lq)).type(out_dtype)
+    return None
+
+
+def _sage_attn_int8_batch(q, k, v, causal, softmax_scale, dtype, out_dtype):
+    """Single-sequence batched INT8+FP16 CUDA op (community T4 build)."""
+    # q/k/v: [seq, H, D] -- promote to a length-1 axis-once batch [1, S, H, D].
+    batch_q = q.reshape(1, q.shape[0], q.shape[1], q.shape[2]).contiguous()
+    batch_k = k.reshape(1, k.shape[0], k.shape[1], k.shape[2]).contiguous()
+    batch_v = v.reshape(1, v.shape[0], v.shape[1], v.shape[2]).contiguous()
+    out = sageattn_qk_int8_pv_fp16_cuda(
+        batch_q, batch_k, batch_v,
+        tensor_layout="NHD",
+        is_causal=causal,
+        sm_scale=softmax_scale,
+        pv_accum_dtype="fp32",
+        return_lse=False,
+    )
+    # out: [1, S, H, D]; the batch axis (size 1) is preserved so the caller
+    # sees the same [B, S, H, D] shape as the varlen/flash path.
+    return out.contiguous().type(out_dtype)
+
+
 def flash_attention(
     q,
     k,
@@ -226,6 +317,23 @@ def flash_attention(
             'Flash attention 3 is not available, use flash attention 2 instead.'
         )
 
+    # SageAttention takes priority: it is an INT8-quantized, faster-and-lower-
+    # VRAM alternative to flash-attn. Fall back to flash/SDPA automatically.
+    # Constraint: neither sage kernel supports dropout_p nor window_size; when
+    # either is requested we fall through to the classic backends.
+    if (SAGE_VARLEN_AVAILABLE or SAGE_INT8_CUDA_AVAILABLE) \
+            and dropout_p == 0. and window_size == (-1, -1):
+        try:
+            sage_out = _sage_attn_pack(
+                q, k, v, q_lens, k_lens, b, lq, lk, causal, softmax_scale,
+                dtype, out_dtype)
+            if sage_out is not None:
+                return sage_out
+        except Exception:
+            # If the kernel rejects the inputs, transparently fall back to
+            # flash-attn / SDPA so inference never breaks.
+            pass
+
     # apply attention
     if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
         # Note: dropout_p, window_size are not supported in FA3 now.
@@ -245,22 +353,37 @@ def flash_attention(
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
     else:
-        assert FLASH_ATTN_2_AVAILABLE
-        x = flash_attn.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            max_seqlen_q=lq,
-            max_seqlen_k=lk,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            deterministic=deterministic).unflatten(0, (b, lq))
+        if FLASH_ATTN_2_AVAILABLE:
+            x = flash_attn.flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
+                    0, dtype=torch.int32).to(q.device, non_blocking=True),
+                cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
+                    0, dtype=torch.int32).to(k.device, non_blocking=True),
+                max_seqlen_q=lq,
+                max_seqlen_k=lk,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                deterministic=deterministic).unflatten(0, (b, lq))
+        else:
+            # No flash-attn (e.g. T4 / sm_75 still needs a working backend):
+            # fall back to torch SDPA on the already-transposed batched view.
+            # The varlen padding torch is ignored when lens are uniform
+            # (the normal ComfyUI single-video case).
+            tq = q.unflatten(0, (b, lq))
+            tk = k.unflatten(0, (b, lk))
+            tv = v.unflatten(0, (b, lk))
+            x = torch.nn.functional.scaled_dot_product_attention(
+                tq.transpose(1, 2),
+                tk.transpose(1, 2),
+                tv.transpose(1, 2),
+                attn_mask=None,
+                is_causal=causal,
+                dropout_p=dropout_p).transpose(1, 2)
 
     # output
     return x.type(out_dtype)
@@ -346,7 +469,7 @@ def attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE or SAGE_ATTN_AVAILABLE:
         return flash_attention(
             q=q,
             k=k,
@@ -489,7 +612,7 @@ def audio_attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE or SAGE_ATTN_AVAILABLE:
         return flash_attention(
             q=q,
             k=k,
@@ -539,7 +662,7 @@ def audio_mask_attention(
     ip_mask=None,
 
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE or SAGE_ATTN_AVAILABLE:
         return flash_attention(
             q=q,
             k=k,
