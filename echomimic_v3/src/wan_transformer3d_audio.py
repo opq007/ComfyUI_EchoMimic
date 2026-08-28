@@ -1596,18 +1596,35 @@ class WanTransformerAudioMask3DModel(ModelMixin, ConfigMixin, FromOriginalModelM
         print(f"loaded 3D transformer's pretrained weights from {pretrained_model_path} ...")
 
         config_file = os.path.join(pretrained_model_path, 'config.json')
-        if not os.path.isfile(config_file):
-            raise RuntimeError(f"{config_file} does not exist")
-        with open(config_file, "r") as f:
-            config = json.load(f)
+        if os.path.isfile(config_file):
+            with open(config_file, "r") as f:
+                config = json.load(f)
+        else:
+            # No config.json next to the weights. This is common for single-file
+            # Wan2.1-Fun checkpoints. The model __init__ defaults already encode
+            # the correct Wan2.1-Fun-1.3B structure, and the actual weights are
+            # applied afterwards via load_state_dict(strict=False), so falling
+            # back to defaults is safe instead of hard-failing.
+            print(f"[WARN] {config_file} does not exist; "
+                  f"building WanTransformerAudioMask3DModel with built-in default config "
+                  f"({pretrained_model_path})")
+            config = {}
+            # EchoMimic is an image-to-video (i2v) model. The i2v/t2v choice
+            # selects the cross-attention block type which maps to different
+            # weight keys, so it must match the checkpoint.
+            transformer_additional_kwargs.setdefault("model_type", "i2v")
+            transformer_additional_kwargs.setdefault("in_channels", 16)
+            transformer_additional_kwargs.setdefault("hidden_size", 2048)
 
         from diffusers.utils import WEIGHTS_NAME
         model_file = os.path.join(pretrained_model_path, WEIGHTS_NAME)
         model_file_safetensors = model_file.replace(".bin", ".safetensors")
 
-        if "dict_mapping" in transformer_additional_kwargs.keys():
+        if config and "dict_mapping" in transformer_additional_kwargs.keys():
             for key in transformer_additional_kwargs["dict_mapping"]:
-                transformer_additional_kwargs[transformer_additional_kwargs["dict_mapping"][key]] = config[key]
+                mapped_key = transformer_additional_kwargs["dict_mapping"][key]
+                if mapped_key in config:
+                    transformer_additional_kwargs[key] = config[mapped_key]
 
         if low_cpu_mem_usage:
             try:
