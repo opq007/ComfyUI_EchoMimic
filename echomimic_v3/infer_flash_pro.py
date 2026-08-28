@@ -27,6 +27,7 @@ from .infer import encode_prompt,get_image_to_video_latent3
 import decord
 import json
 import random
+import glob
 import math
 import comfy.model_management as mm
 import librosa
@@ -41,6 +42,56 @@ import pyloudnorm as pyln
 from transformers import Wav2Vec2FeatureExtractor
 from  .src.wav2vec2 import Wav2Vec2Model
 from einops import rearrange
+
+
+def resolve_checkpoint_path(preferred, root_dir, name_hints=("flash", "echomimicv3", "diffusion_pytorch_model", "safetensors", "pth", "bin")):
+    """Resolve the actual checkpoint path to load.
+
+    The preferred path (exact location the script was written for) usually
+    works, but on some setups the file lives in a different subdirectory or
+    under a slightly different name. Rather than failing, we search the
+    weights root recursively and pick the first plausible checkpoint.
+
+    Args:
+        preferred:  The exact path the code was written for.
+        root_dir:   Base directory to search when `preferred` is missing.
+        name_hints: Substring hints, in priority order, to score candidates by.
+    """
+    if os.path.isfile(preferred):
+        return preferred
+
+    # Fuzzy recursive search under root_dir for *.safetensors / *.pth / *.bin
+    candidates = []
+    for ext in (".safetensors", ".pth", ".pt", ".bin"):
+        candidates += glob.glob(os.path.join(root_dir, "**", f"*{ext}"),
+                                recursive=True)
+
+    if not candidates:
+        return None
+
+    def score(path):
+        base = os.path.basename(path).lower()
+        s = 0
+        for i, hint in enumerate(name_hints):
+            if hint.lower() in path.lower():
+                s += 100 - i * 10
+        # Prefer files under an "echo...flash..." directory (the actual weights)
+        low = path.lower()
+        if ("flash" in low or "echomimic" in low) and "safetensors" in low:
+            s += 50
+        # Secondary signal: larger generic weights are usually the 1.3B model.
+        try:
+            s += min(os.path.getsize(path) // (1024 * 1024), 5000) // 100
+        except OSError:
+            pass
+        return s
+
+    best = max(candidates, key=score)
+    if best is not None:
+        print(f"[resolve_checkpoint] preferred not found: {preferred}")
+        print(f"[resolve_checkpoint] auto-resolved to: {best}")
+    return best
+
 
 def clear_comfyui_cache():
     cf_models=mm.loaded_models()
@@ -192,7 +243,10 @@ def load_v3_flash(sampler_name,vae_path,inp_vae,weigths_current_path,config_path
         low_cpu_mem_usage=True if not fsdp_dit else False,
         torch_dtype=weight_dtype,
     )
-    transformer_path=os.path.join(weigths_current_path,"echomimicv3-flash-pro/diffusion_pytorch_model.safetensors")
+    transformer_path=resolve_checkpoint_path(
+        os.path.join(weigths_current_path,"echomimicv3-flash-pro/diffusion_pytorch_model.safetensors"),
+        weigths_current_path,
+    )
     ckpt_idx=50000
     if transformer_path is not None:
         
