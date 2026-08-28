@@ -1859,7 +1859,9 @@ class WanTransformerAudioMask3DModel(ModelMixin, ConfigMixin, FromOriginalModelM
                 for key in _state_dict:
                     state_dict[key] = _state_dict[key]
         
-        if model.state_dict()['patch_embedding.weight'].size() != state_dict['patch_embedding.weight'].size():
+        if (state_dict and 'patch_embedding.weight' in state_dict
+                and model.state_dict().get('patch_embedding.weight') is not None
+                and model.state_dict()['patch_embedding.weight'].size() != state_dict['patch_embedding.weight'].size()):
             model.state_dict()['patch_embedding.weight'][:, :state_dict['patch_embedding.weight'].size()[1], :, :] = state_dict['patch_embedding.weight']
             model.state_dict()['patch_embedding.weight'][:, state_dict['patch_embedding.weight'].size()[1]:, :, :] = 0
             state_dict['patch_embedding.weight'] = model.state_dict()['patch_embedding.weight']
