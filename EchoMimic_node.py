@@ -28,6 +28,41 @@ current_path = os.path.dirname(os.path.abspath(__file__))
 
 
 # pre dir
+def _save_audio_tensor(waveform, sample_rate, path, backend=None):
+    """Persist an audio tensor to `path` robustly across torchaudio versions.
+
+    Newer torchaudio (>=2.9) delegates saving to TorchCodec, which refuses to
+    encode into an in-memory ``BytesIO``/extension-less target ("Couldn't
+    allocate AVFormatContext ... check the desired extension?"). This helper
+    therefore writes to a real file whose extension tells the backend the
+    container format, and falls back to ``soundfile`` (always importable, no
+    CUDA/torchcodec dependency) if the primary backend fails.
+
+    Args:
+        waveform: ``(channels, samples)`` float tensor.
+        sample_rate: sampling rate in Hz.
+        path: destination file path (real file, with extension).
+        backend: force a backend ("torchcodec"|"soundfile"); None = auto.
+    """
+    import numpy as _np
+
+    def _via_soundfile():
+        import soundfile as sf
+        data = waveform.cpu().numpy().T  # soundfile wants (samples, channels)
+        sf.write(path, data, int(sample_rate), format="FLAC", subtype="PCM_16")
+
+    if backend is None or backend == "torchcodec":
+        try:
+            torchaudio.save(path, waveform.cpu(), int(sample_rate), format="FLAC")
+            return
+        except Exception as e1:
+            if backend == "torchcodec":
+                raise
+            print(f"[EchoMimic] WARN: torchaudio.save failed ({e1}); "
+                  f"falling back to soundfile.")
+    _via_soundfile()
+
+
 def _safe_makedirs(path):
     """Create a weights/output directory when possible, but never abort the
     custom node if the location is read-only.
@@ -202,12 +237,8 @@ class Echo_Predata:
 
         #pre audio
         audio_file_prefix = ''.join(random.choice("0123456789") for _ in range(6))
-        audio_file = os.path.join(folder_paths.get_input_directory(), f"audio_{audio_file_prefix}_temp.wav")
-        buff = io_base.BytesIO()
-   
-        torchaudio.save(buff, audio["waveform"].squeeze(0), audio["sample_rate"], format="FLAC")
-        with open(audio_file, 'wb') as f:
-            f.write(buff.getbuffer())
+        audio_file = os.path.join(folder_paths.get_input_directory(), f"audio_{audio_file_prefix}_temp.flac")
+        _save_audio_tensor(audio["waveform"].squeeze(0).cpu(), audio["sample_rate"], audio_file)
 
         # pre data
         if "V1"==version :
