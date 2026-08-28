@@ -28,33 +28,50 @@ current_path = os.path.dirname(os.path.abspath(__file__))
 
 
 # pre dir
+def _safe_makedirs(path):
+    """Create a weights/output directory when possible, but never abort the
+    custom node if the location is read-only.
+
+    Model weights may be mounted through a read-only symlink (Kaggle datasets,
+    shared stores). The plugin then must NOT try to create subdirectories
+    inside them and crash the whole node with 'Read-only file system'.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+        return True
+    except Exception as e:
+        print(f"[EchoMimic] WARN: cannot create directory '{path}' "
+              f"(read-only or missing permissions?): {e}")
+        return False
+
+
 weigths_current_path = os.path.join(folder_paths.models_dir, "echo_mimic")
 if not os.path.exists(weigths_current_path):
-    os.makedirs(weigths_current_path)
+    _safe_makedirs(weigths_current_path)
 
 weigths_unet_current_path = os.path.join(weigths_current_path, "unet")
 if not os.path.exists(weigths_unet_current_path):
-    os.makedirs(weigths_unet_current_path)
+    _safe_makedirs(weigths_unet_current_path)
 
 weigths_vae_current_path = os.path.join(weigths_current_path, "vae")
 if not os.path.exists(weigths_vae_current_path):
-    os.makedirs(weigths_vae_current_path)
+    _safe_makedirs(weigths_vae_current_path)
 
 weigths_au_current_path = os.path.join(weigths_current_path, "audio_processor")
 if not os.path.exists(weigths_au_current_path):
-    os.makedirs(weigths_au_current_path)
+    _safe_makedirs(weigths_au_current_path)
 
 tensorrt_lite = os.path.join(folder_paths.get_input_directory(), "tensorrt_lite")
 if not os.path.exists(tensorrt_lite):
-    os.makedirs(tensorrt_lite)
+    _safe_makedirs(tensorrt_lite)
 
 weigths_trans_current_path = os.path.join(weigths_current_path, "transformer")
 if not os.path.exists(weigths_trans_current_path):
-    os.makedirs(weigths_trans_current_path)
+    _safe_makedirs(weigths_trans_current_path)
 
 weigths_deepface_current_path = os.path.join(weigths_current_path, ".deepface/weights")
 if not os.path.exists(weigths_deepface_current_path):
-    os.makedirs(weigths_deepface_current_path)
+    _safe_makedirs(weigths_deepface_current_path)
 
 
 
